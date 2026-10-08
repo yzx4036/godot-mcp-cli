@@ -68,9 +68,10 @@ func _input(event):
 				_trigger_stack_error()
 
 func cause_intentional_error():
-	# This function will trigger an error to test stack frames
+	# This function triggers an error to test stack frames
+	# Note: This will cause input simulation to timeout for SPACE/T keys
+	# because GDScript errors in _input handlers break async continuations
 	var invalid_dict = {"key": "value"}
-	# Try to access a non-existent key that will cause a runtime error
 	invalid_dict.non_existent_method_call()
 
 func _trigger_stack_error():

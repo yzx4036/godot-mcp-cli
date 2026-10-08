@@ -46,7 +46,13 @@ func process_command(client_id: int, command_type: String, params: Dictionary, c
 		"get_input_actions":
 			_handle_get_input_actions(client_id, params, command_id)
 			return true
-	
+		"take_screenshot":
+			_handle_take_screenshot(client_id, params, command_id)
+			return true
+		"get_viewport_info":
+			_handle_get_viewport_info(client_id, params, command_id)
+			return true
+
 	return false
 
 
@@ -317,11 +323,11 @@ func _take_input_result(session_id: int, request_id: int) -> Dictionary:
 	var runtime_bridge := _get_runtime_bridge()
 	if runtime_bridge == null:
 		return {}
-	
+
 	# Check if runtime bridge has take method
 	if runtime_bridge.has_method("take_input_result"):
 		return runtime_bridge.take_input_result(session_id, request_id)
-	
+
 	# Fallback: access _sessions directly if accessible
 	var sessions_dict = runtime_bridge.get("_sessions")
 	if sessions_dict and sessions_dict.has(session_id):
@@ -333,5 +339,24 @@ func _take_input_result(session_id: int, request_id: int) -> Dictionary:
 			state["input_results"] = input_results
 			sessions_dict[session_id] = state
 			return result
-	
+
 	return {}
+
+
+func _handle_take_screenshot(client_id: int, _params: Dictionary, command_id: String) -> void:
+	# Use longer timeout for screenshots (they can take time to capture and encode)
+	var timeout := 5000
+
+	var result := await _send_input_command("take_screenshot", [], timeout)
+	if result.has("error"):
+		_send_error(client_id, result["error"], command_id)
+	else:
+		_send_success(client_id, result, command_id)
+
+
+func _handle_get_viewport_info(client_id: int, _params: Dictionary, command_id: String) -> void:
+	var result := await _send_input_command("get_viewport_info", [])
+	if result.has("error"):
+		_send_error(client_id, result["error"], command_id)
+	else:
+		_send_success(client_id, result, command_id)

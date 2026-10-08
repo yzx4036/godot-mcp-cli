@@ -10,11 +10,12 @@ const CAPTURE_SCENE := "scene"
 const VIEW_HAS_VISIBLE_METHOD := 1 << 1
 const VIEW_VISIBLE := 1 << 2
 const VIEW_VISIBLE_IN_TREE := 1 << 3
-const DEFAULT_TIMEOUT_MS := 800
-const DEFAULT_EVAL_TIMEOUT_MS := 800
-const SCENE_CAPTURE_NAMES := ["scene", "limboai"]
+const DEFAULT_TIMEOUT_MS := 2000
+const DEFAULT_EVAL_TIMEOUT_MS := 2000
+const SCENE_CAPTURE_NAMES := ["scene", "limboai", "mcp_scene"]
 const EVAL_CAPTURE_NAME := "mcp_eval"
 const INPUT_CAPTURE_NAME := "mcp_input"
+const MCP_SCENE_CAPTURE_NAME := "mcp_scene"
 
 var _sessions: Dictionary = {}
 var _next_eval_request_id: int = 1
@@ -43,6 +44,10 @@ func _has_capture(capture: String) -> bool:
 			return true
 	if capture == INPUT_CAPTURE_NAME or capture.begins_with(INPUT_CAPTURE_NAME + ":"):
 		return true
+	if capture == EVAL_CAPTURE_NAME or capture.begins_with(EVAL_CAPTURE_NAME + ":"):
+		return true
+	if capture == MCP_SCENE_CAPTURE_NAME or capture.begins_with(MCP_SCENE_CAPTURE_NAME + ":"):
+		return true
 	return false
 
 func _capture(message: String, data: Array, session_id: int) -> bool:
@@ -63,6 +68,10 @@ func _capture(message: String, data: Array, session_id: int) -> bool:
 		_trace("received input result for session %s" % session_id)
 		_store_input_result(session_id, data)
 		return true
+	elif normalized == "%s:result" % MCP_SCENE_CAPTURE_NAME:
+		_trace("received mcp_scene result for session %s" % session_id)
+		_store_mcp_scene_result(session_id, data)
+		return true
 	return false
 
 func request_runtime_scene_snapshot() -> Dictionary:
@@ -75,23 +84,37 @@ func request_runtime_scene_snapshot() -> Dictionary:
 
 	var state: Dictionary = _sessions[session_id]
 	var baseline_version: int = state.get("tree_version", 0)
+	var mcp_baseline: int = state.get("mcp_scene_version", 0)
+
+	# Request scene tree through both mechanisms for compatibility
 	_request_scene_tree(session_id)
+	_request_mcp_scene_tree(session_id)
 
 	return {
 		"session_id": session_id,
-		"baseline_version": baseline_version
+		"baseline_version": baseline_version,
+		"mcp_baseline": mcp_baseline
 	}
 
 func has_new_runtime_snapshot(session_id: int, baseline_version: int) -> bool:
 	if not _sessions.has(session_id):
 		return false
 	var state: Dictionary = _sessions[session_id]
-	return state.get("tree_version", 0) > baseline_version and state.get("tree")
+	# Check both Godot's built-in scene tree and our custom MCP scene tree
+	var has_builtin: bool = state.get("tree_version", 0) > baseline_version and state.get("tree") != null
+	var has_mcp: bool = state.get("mcp_scene") != null
+	return has_builtin or has_mcp
 
 func build_runtime_snapshot(session_id: int, options: Dictionary = {}) -> Dictionary:
 	if not _sessions.has(session_id):
 		return {}
 	var state: Dictionary = _sessions[session_id]
+
+	# Prefer our MCP scene data as it's more reliable
+	if state.get("mcp_scene"):
+		return state["mcp_scene"]
+
+	# Fall back to Godot's built-in scene tree
 	if not state.get("tree"):
 		return {}
 	return _build_response(state["tree"], options)
@@ -193,6 +216,48 @@ func _store_scene_tree(session_id: int, payload: Array) -> void:
 	var state: Dictionary = _sessions.get(session_id, {})
 	state["tree"] = parsed
 	state["tree_version"] = state.get("tree_version", 0) + 1
+	state["last_update"] = Time.get_ticks_msec()
+	_sessions[session_id] = state
+
+	scene_tree_updated.emit(session_id)
+
+
+func _request_mcp_scene_tree(session_id: int) -> void:
+	var session := get_session(session_id)
+	_trace("request_mcp_scene_tree session=%s session=%s" % [session_id, session])
+	if session and session.is_active():
+		var request_id := _next_eval_request_id
+		_next_eval_request_id += 1
+		var payload := Array()
+		payload.push_back(request_id)
+		payload.push_back({})  # options
+		session.send_message("%s:get_tree" % MCP_SCENE_CAPTURE_NAME, payload)
+		var state: Dictionary = _sessions.get(session_id, {})
+		state["last_mcp_scene_request"] = Time.get_ticks_msec()
+		_sessions[session_id] = state
+	else:
+		_trace("session inactive, cannot request mcp scene tree")
+
+
+func _store_mcp_scene_result(session_id: int, payload: Array) -> void:
+	_ensure_session(session_id)
+	if payload.is_empty():
+		_trace("mcp_scene payload empty")
+		return
+
+	var entry: Variant = payload[0]
+	if typeof(entry) != TYPE_DICTIONARY:
+		_trace("mcp_scene payload not dictionary")
+		return
+
+	var result_dict: Dictionary = entry.duplicate(true)
+	if not result_dict.get("success", false):
+		_trace("mcp_scene result indicates failure: %s" % result_dict.get("error", "unknown"))
+		return
+
+	var state: Dictionary = _sessions.get(session_id, {})
+	state["mcp_scene"] = result_dict
+	state["mcp_scene_version"] = state.get("mcp_scene_version", 0) + 1
 	state["last_update"] = Time.get_ticks_msec()
 	_sessions[session_id] = state
 
@@ -357,6 +422,8 @@ func _ensure_session(session_id: int) -> void:
 		_sessions[session_id] = {
 			"tree": null,
 			"tree_version": 0,
+			"mcp_scene": null,
+			"mcp_scene_version": 0,
 			"last_update": 0,
 			"active": false,
 			"eval_results": {},
@@ -385,7 +452,13 @@ func _on_session_breaked(can_debug: bool, session_id: int) -> void:
 	_trace("session %s breaked can_debug=%s" % [session_id, can_debug])
 
 func _normalize_capture_name(message: String) -> String:
+	# Handle MCP scene capture first (before general scene captures)
+	if message.begins_with("%s:" % MCP_SCENE_CAPTURE_NAME):
+		var mcp_scene_suffix := message.substr(MCP_SCENE_CAPTURE_NAME.length() + 1)
+		return "%s:%s" % [MCP_SCENE_CAPTURE_NAME, mcp_scene_suffix]
 	for prefix in SCENE_CAPTURE_NAMES:
+		if prefix == MCP_SCENE_CAPTURE_NAME:
+			continue  # Already handled above
 		var needle := "%s:" % prefix
 		if message.begins_with(needle):
 			var suffix := message.substr(needle.length())

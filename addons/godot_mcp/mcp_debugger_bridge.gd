@@ -500,7 +500,7 @@ func step_into() -> Dictionary:
 
 
 # Call stack and inspection
-func get_call_stack(session_id = null, timeout_ms: int = 750) -> Dictionary:
+func get_call_stack(session_id = null, timeout_ms: int = 2000) -> Dictionary:
 	var candidate_ids := _collect_session_candidate_ids(session_id)
 	if candidate_ids.is_empty():
 		return {
@@ -533,6 +533,11 @@ func get_call_stack(session_id = null, timeout_ms: int = 750) -> Dictionary:
 
 		var stack_info := await _wait_for_stack_dump(normalized_id, request_timestamp, timeout_ms)
 		if stack_info.has("error"):
+			# Fallback: Try to get stack info from the editor's Stack Trace panel
+			var fallback_info := _get_stack_from_panel(normalized_id)
+			if not fallback_info.is_empty() and not fallback_info.has("error"):
+				fallback_info["source"] = "panel_fallback"
+				return fallback_info
 			last_error = stack_info
 			continue
 
@@ -544,6 +549,207 @@ func get_call_stack(session_id = null, timeout_ms: int = 750) -> Dictionary:
 			"message": "No debugger session responded"
 		}
 	return last_error
+
+
+func _get_stack_from_panel(session_id) -> Dictionary:
+	# Try to read stack trace directly from the editor's Stack Trace panel
+	var plugin = Engine.get_meta("GodotMCPPlugin") if Engine.has_meta("GodotMCPPlugin") else null
+	if plugin == null:
+		return {}
+
+	var editor_interface = plugin.get_editor_interface() if plugin.has_method("get_editor_interface") else null
+	if editor_interface == null:
+		return {}
+
+	# Search for the Stack Trace tab in the debugger panel
+	var base_control = editor_interface.get_base_control() if editor_interface.has_method("get_base_control") else null
+	if base_control == null:
+		return {}
+
+	var stack_tab := _find_stack_trace_tab(base_control)
+	if stack_tab == null:
+		return {}
+
+	var frames := _extract_frames_from_tab(stack_tab)
+	if frames.is_empty():
+		return {}
+
+	return {
+		"frames": frames,
+		"total_frames": frames.size(),
+		"current_frame": 0,
+		"session_id": session_id,
+		"timestamp": Time.get_ticks_msec()
+	}
+
+
+func _find_stack_trace_tab(root: Node) -> Control:
+	if not is_instance_valid(root):
+		return null
+
+	var queue: Array = [root]
+	var visited := 0
+	while queue.size() > 0 and visited < 10000:
+		var candidate = queue.pop_front()
+		visited += 1
+		if not is_instance_valid(candidate):
+			continue
+
+		if candidate is TabContainer:
+			var tab_container: TabContainer = candidate
+			var tab_count: int = tab_container.get_tab_count() if tab_container.has_method("get_tab_count") else 0
+			for i in range(tab_count):
+				var title := ""
+				if tab_container.has_method("get_tab_title"):
+					title = String(tab_container.get_tab_title(i))
+				if title.to_lower() == "stack trace":
+					var tab_control: Control = null
+					if tab_container.has_method("get_tab_control"):
+						tab_control = tab_container.get_tab_control(i)
+					if is_instance_valid(tab_control):
+						return tab_control
+
+		for child in candidate.get_children():
+			if child is Node:
+				queue.append(child)
+
+	return null
+
+
+func _extract_frames_from_tab(tab: Control) -> Array:
+	var frames: Array = []
+	if not is_instance_valid(tab):
+		return frames
+
+	# Try to find a Tree control inside the tab
+	var tree := _find_tree_in_control(tab)
+	if tree == null:
+		# Fallback: try to extract text from any text control
+		var text := _extract_text_from_control(tab)
+		if not text.is_empty():
+			frames = _parse_stack_text(text)
+		return frames
+
+	# Extract frames from tree items
+	var root_item := tree.get_root()
+	if root_item == null:
+		return frames
+
+	var item := root_item.get_first_child() if root_item.has_method("get_first_child") else null
+	if item == null:
+		item = root_item
+
+	var frame_index := 0
+	while item:
+		var frame := _parse_tree_item_to_frame(item, frame_index)
+		if not frame.is_empty():
+			frames.append(frame)
+			frame_index += 1
+		item = item.get_next() if item.has_method("get_next") else null
+
+	return frames
+
+
+func _find_tree_in_control(control: Control) -> Tree:
+	if not is_instance_valid(control):
+		return null
+
+	var queue: Array = [control]
+	while queue.size() > 0:
+		var candidate = queue.pop_front()
+		if not is_instance_valid(candidate):
+			continue
+		if candidate is Tree:
+			return candidate
+		for child in candidate.get_children():
+			if child is Node:
+				queue.append(child)
+	return null
+
+
+func _extract_text_from_control(control: Control) -> String:
+	if not is_instance_valid(control):
+		return ""
+
+	if control.has_method("get_parsed_text"):
+		return String(control.call("get_parsed_text"))
+	if control.has_method("get_text"):
+		return String(control.call("get_text"))
+
+	# Try children
+	for child in control.get_children():
+		if child is Control:
+			var text := _extract_text_from_control(child)
+			if not text.is_empty():
+				return text
+	return ""
+
+
+func _parse_stack_text(text: String) -> Array:
+	var frames: Array = []
+	var lines := text.split("\n", false)
+	var current_script := ""
+	var frame_index := 0
+
+	for line in lines:
+		var trimmed := String(line).strip_edges()
+		if trimmed.is_empty():
+			continue
+
+		# Check if this is a script path
+		if trimmed.begins_with("res://") or trimmed.begins_with("user://"):
+			current_script = trimmed
+		elif trimmed.begins_with("Line "):
+			# Parse "Line X" format
+			var line_num := -1
+			var parts := trimmed.split(" ", false)
+			if parts.size() >= 2 and parts[1].is_valid_int():
+				line_num = int(parts[1])
+
+			if not current_script.is_empty() and line_num >= 0:
+				frames.append({
+					"index": frame_index,
+					"script": current_script,
+					"file": current_script,
+					"line": line_num,
+					"function": ""
+				})
+				frame_index += 1
+
+	return frames
+
+
+func _parse_tree_item_to_frame(item: TreeItem, index: int) -> Dictionary:
+	if not is_instance_valid(item):
+		return {}
+
+	var text := item.get_text(0) if item.has_method("get_text") else ""
+	if text.is_empty():
+		return {}
+
+	# Try to parse script:line format
+	var script := ""
+	var line := -1
+	var function_name := ""
+
+	# Check for "script.gd:123" format
+	var colon_idx := text.rfind(":")
+	if colon_idx > 0:
+		var line_part := text.substr(colon_idx + 1).strip_edges()
+		if line_part.is_valid_int():
+			line = int(line_part)
+			script = text.substr(0, colon_idx).strip_edges()
+
+	if script.is_empty():
+		script = text
+
+	return {
+		"index": index,
+		"script": script,
+		"file": script,
+		"line": line,
+		"function": function_name
+	}
 
 func get_cached_stack_info(session_id) -> Dictionary:
 	var normalized_id = _normalize_session_id(session_id)

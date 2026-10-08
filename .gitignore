@@ -50,6 +50,7 @@ UPDATE.md
 CLAUDE.md
 AGENTS.md
 examples/
-.claude/
+.claude/settings.json
+.claude/settings.local.json
 .mcp.json
 opencode.json

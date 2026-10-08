@@ -10,6 +10,7 @@ import { scriptResourceTools } from './tools/script_resource_tools.js';
 import { debuggerTools } from './tools/debugger_tools.js';
 import { projectTools } from './tools/project_tools.js';
 import { inputTools } from './tools/input_tools.js';
+import { screenshotTools } from './tools/screenshot_tools.js';
 import { getGodotConnection } from './utils/godot_connection.js';
 
 // Import resources
@@ -65,7 +66,8 @@ async function main() {
     ...projectTools,
     ...scriptResourceTools,
     ...debuggerTools,
-    ...inputTools
+    ...inputTools,
+    ...screenshotTools
   ];
 
   allTools.forEach(tool => {
